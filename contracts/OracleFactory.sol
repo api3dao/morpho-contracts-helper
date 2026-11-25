@@ -20,7 +20,8 @@ import {AggregatorV3Interface} from "./external/morpho/interfaces/AggregatorV3In
  *        ≥ 25h       : Remains flat at the initial base price
  * ─────────────────────────────────────────────────────────────────────
  *
- * simStartTime: Timestamp of t=0 for the simulation (automatically set on setMode() or deployment)
+ * simStartTime: Timestamp of t=0 for the simulation (set on deployment, setMode(), setBasePrice()
+ *               in simulation modes, and restartSimulation())
  * basisPoints : Rate of change (1 bp = 0.01%, e.g., 50 = 0.5% per STEP/HOUR)
  */
 contract ManualChainlinkMockFeed is AggregatorV3Interface {
@@ -34,6 +35,9 @@ contract ManualChainlinkMockFeed is AggregatorV3Interface {
     uint256 private constant STEP = 300; // 5 minutes step for trending modes
     uint256 private constant HOUR = 3600; // 1 hour step for crash & recover mode
     uint256 private constant BPS_DENOM = 10_000;
+    /// @dev Upper bound for the compounded multiplier (scaled by BPS_DENOM), i.e. growth is capped at
+    ///      1e34x the base price. Keeps every intermediate product below 2^256.
+    uint256 private constant MAX_MULTIPLIER = 1e38;
 
     // ── Storage ──────────────────────────────────────────────────────
     mapping(address => bool) public isOwner;
@@ -66,6 +70,7 @@ contract ManualChainlinkMockFeed is AggregatorV3Interface {
         uint8 simMode_
     ) {
         require(owners_.length > 0, "No owners provided");
+        require(simMode_ <= MODE_CRASH_AND_RECOVER, "Invalid mode");
         for (uint256 i = 0; i < owners_.length; i++) {
             require(owners_[i] != address(0), "Zero address");
             isOwner[owners_[i]] = true;
@@ -216,8 +221,8 @@ contract ManualChainlinkMockFeed is AggregatorV3Interface {
     }
 
     /**
-     * @dev Compound Growth: value * ((10000 + bp) / 10000)^n
-     *      Iterative approach used to manage precision and avoid overflow.
+     * @dev Compound Growth: value * ((10000 + bp) / 10000)^n, computed by exponentiation by squaring.
+     *      The multiplier saturates at MAX_MULTIPLIER so long-running trends never revert.
      */
     function _compoundGrow(
         int256  value,
@@ -229,13 +234,22 @@ contract ManualChainlinkMockFeed is AggregatorV3Interface {
         uint256 baseRate = BPS_DENOM + bp;
         uint256 multiplier = BPS_DENOM;
         
-        // Exponentiation by squaring
-        while (n > 0) {
-            if (n % 2 == 1) {
+        while (true) {
+            if (n & 1 == 1) {
                 multiplier = (multiplier * baseRate) / BPS_DENOM;
+                if (multiplier >= MAX_MULTIPLIER) {
+                    multiplier = MAX_MULTIPLIER;
+                    break;
+                }
             }
+            n >>= 1;
+            if (n == 0) break;
             baseRate = (baseRate * baseRate) / BPS_DENOM;
-            n /= 2;
+            // A remaining set bit of n will multiply by at least baseRate, so the result saturates.
+            if (baseRate >= MAX_MULTIPLIER) {
+                multiplier = MAX_MULTIPLIER;
+                break;
+            }
         }
         
         return (value * int256(multiplier)) / int256(BPS_DENOM);
@@ -254,12 +268,13 @@ contract ManualChainlinkMockFeed is AggregatorV3Interface {
         uint256 baseRate = BPS_DENOM - bp;
         uint256 multiplier = BPS_DENOM;
         
-        while (n > 0) {
-            if (n % 2 == 1) {
+        while (true) {
+            if (n & 1 == 1) {
                 multiplier = (multiplier * baseRate) / BPS_DENOM;
             }
+            n >>= 1;
+            if (n == 0 || multiplier == 0) break;
             baseRate = (baseRate * baseRate) / BPS_DENOM;
-            n /= 2;
         }
         
         return (value * int256(multiplier)) / int256(BPS_DENOM);
@@ -270,10 +285,11 @@ contract ManualChainlinkMockFeed is AggregatorV3Interface {
     /**
      * @notice Updates the simulation mode and resets the timer to current timestamp.
      * @param mode_        New mode (0-3)
-     * @param basisPoints_ Rate of change (bp). Ignored in MANUAL mode.
+     * @param basisPoints_ Rate of change (bp), at most 10000 (100%). Ignored in MANUAL mode.
      */
     function setMode(uint8 mode_, uint256 basisPoints_) external onlyOwner {
         require(mode_ <= MODE_CRASH_AND_RECOVER, "Invalid mode");
+        require(basisPoints_ <= BPS_DENOM, "Invalid basisPoints");
         simMode     = mode_;
         simStartTime = block.timestamp;
         basisPoints = basisPoints_;
@@ -290,7 +306,8 @@ contract ManualChainlinkMockFeed is AggregatorV3Interface {
     }
 
     /**
-     * @notice Updates the initial base price for automated simulation modes without resetting the timer.
+     * @notice Updates the base price. In simulation modes this also restarts the simulation timer,
+     *         so the curve starts again from t=0 at the new base price and the round id resets to 1.
      */
     function setBasePrice(int256 newBasePrice) external onlyOwner {
         _price = newBasePrice;

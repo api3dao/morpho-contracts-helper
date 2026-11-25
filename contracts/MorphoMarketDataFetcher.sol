@@ -7,6 +7,7 @@ import {AggregatorV3Interface} from "./external/morpho/interfaces/AggregatorV3In
 import {IMorpho, MarketParams, Market,  Id, Position} from "./external/morpho/interfaces/IMorpho.sol";
 import {IMorphoChainlinkOracleV2} from "./external/morpho/interfaces/IMorphoChainlinkOracleV2.sol";
 import {IERC4626} from "./external/morpho/interfaces/IERC4626.sol";
+import {IOracle} from "./external/morpho/interfaces/IOracle.sol";
 
 contract MorphoMarketDataFetcher {
 
@@ -55,6 +56,11 @@ contract MorphoMarketDataFetcher {
         uint256 deadAddressSupply;
     }
 
+    /// @notice Returns token, oracle and feed metadata for a Morpho Blue market.
+    /// @dev Never reverts on a misbehaving or missing token/oracle/feed: every external read is a
+    ///      low-level staticcall, and fields that cannot be read are left zero/empty. This covers
+    ///      addresses without code (e.g. idle markets with collateralToken == address(0)),
+    ///      tokens returning bytes32 from name()/symbol(), and malformed return data.
     function getMarketDetails(
         bytes32 marketId,
         address user
@@ -63,62 +69,27 @@ contract MorphoMarketDataFetcher {
         MarketParams memory params = IMorpho(morphoAddress).idToMarketParams(Id.wrap(marketId));
         
         data.marketParams = params;
-        
-        data.loanToken.tokenAddress = params.loanToken;
-        try IERC20Metadata(params.loanToken).name() returns (string memory _name) { data.loanToken.name = _name; } catch {}
-        try IERC20Metadata(params.loanToken).symbol() returns (string memory _sym) { data.loanToken.symbol = _sym; } catch {}
-        try IERC20Metadata(params.loanToken).decimals() returns (uint8 _dec) { data.loanToken.decimals = _dec; } catch {}
-        
-        if (user != address(0) && morphoAddress != address(0)) {
-            try IERC20Metadata(params.loanToken).allowance(user, morphoAddress) returns (uint256 _allow) { 
-                data.loanToken.userAllowance = _allow; 
-            } catch {}
+
+        data.loanToken = _tokenInfo(params.loanToken, user);
+        data.collateralToken = _tokenInfo(params.collateralToken, address(0));
+
+        address oracle = params.oracle;
+        if (oracle.code.length > 0) {
+            data.oracle.oracleAddress = oracle;
+            data.oracle.baseFeed1 = AggregatorV3Interface(_tryAddress(oracle, IMorphoChainlinkOracleV2.BASE_FEED_1.selector));
+            data.oracle.baseFeed2 = AggregatorV3Interface(_tryAddress(oracle, IMorphoChainlinkOracleV2.BASE_FEED_2.selector));
+            data.oracle.baseVault = IERC4626(_tryAddress(oracle, IMorphoChainlinkOracleV2.BASE_VAULT.selector));
+            data.oracle.baseVaultConversionSample = _tryUint(oracle, IMorphoChainlinkOracleV2.BASE_VAULT_CONVERSION_SAMPLE.selector);
+            data.oracle.quoteFeed1 = AggregatorV3Interface(_tryAddress(oracle, IMorphoChainlinkOracleV2.QUOTE_FEED_1.selector));
+            data.oracle.quoteFeed2 = AggregatorV3Interface(_tryAddress(oracle, IMorphoChainlinkOracleV2.QUOTE_FEED_2.selector));
+            data.oracle.quoteVault = IERC4626(_tryAddress(oracle, IMorphoChainlinkOracleV2.QUOTE_VAULT.selector));
+            data.oracle.quoteVaultConversionSample = _tryUint(oracle, IMorphoChainlinkOracleV2.QUOTE_VAULT_CONVERSION_SAMPLE.selector);
+            data.oracle.scaleFactor = _tryUint(oracle, IMorphoChainlinkOracleV2.SCALE_FACTOR.selector);
+            data.oracle.currentPrice = _tryUint(oracle, IOracle.price.selector);
         }
 
-        data.collateralToken.tokenAddress = params.collateralToken;
-        try IERC20Metadata(params.collateralToken).name() returns (string memory _name) { data.collateralToken.name = _name; } catch {}
-        try IERC20Metadata(params.collateralToken).symbol() returns (string memory _sym) { data.collateralToken.symbol = _sym; } catch {}
-        try IERC20Metadata(params.collateralToken).decimals() returns (uint8 _dec) { data.collateralToken.decimals = _dec; } catch {}
-
-        if (params.oracle != address(0)) {
-            data.oracle.oracleAddress = params.oracle;
-            try IMorphoChainlinkOracleV2(params.oracle).BASE_FEED_1() returns (AggregatorV3Interface a) { data.oracle.baseFeed1 = a; } catch {}
-            try IMorphoChainlinkOracleV2(params.oracle).BASE_FEED_2() returns (AggregatorV3Interface a) { data.oracle.baseFeed2 = a; } catch {}
-            try IMorphoChainlinkOracleV2(params.oracle).BASE_VAULT() returns (IERC4626 a) { data.oracle.baseVault = a; } catch {}
-            try IMorphoChainlinkOracleV2(params.oracle).BASE_VAULT_CONVERSION_SAMPLE() returns (uint256 a) { data.oracle.baseVaultConversionSample = a; } catch {}
-            try IMorphoChainlinkOracleV2(params.oracle).QUOTE_FEED_1() returns (AggregatorV3Interface a) { data.oracle.quoteFeed1 = a; } catch {}
-            try IMorphoChainlinkOracleV2(params.oracle).QUOTE_FEED_2() returns (AggregatorV3Interface a) { data.oracle.quoteFeed2 = a; } catch {}
-            try IMorphoChainlinkOracleV2(params.oracle).QUOTE_VAULT() returns (IERC4626 a) { data.oracle.quoteVault = a; } catch {}
-            try IMorphoChainlinkOracleV2(params.oracle).QUOTE_VAULT_CONVERSION_SAMPLE() returns (uint256 a) { data.oracle.quoteVaultConversionSample = a; } catch {}
-            try IMorphoChainlinkOracleV2(params.oracle).SCALE_FACTOR() returns (uint256 s) { data.oracle.scaleFactor = s; } catch {}
-            try IMorphoChainlinkOracleV2(params.oracle).price() returns (uint256 p) { data.oracle.currentPrice = p; } catch {}
-        }
-        
-        if (address(data.oracle.baseFeed1) != address(0)) {
-            data.oracle.baseFeed.oracleAddress = address(data.oracle.baseFeed1);
-            
-            try data.oracle.baseFeed1.latestRoundData() returns (
-                uint80, int256 answer, uint256, uint256, uint80
-            ) { 
-                data.oracle.baseFeed.price = answer > 0 ? uint256(answer) : 0; 
-            } catch {}
-
-            try data.oracle.baseFeed1.decimals() returns (uint8 _dec) { data.oracle.baseFeed.decimals = _dec; } catch {}
-            try data.oracle.baseFeed1.description() returns (string memory _sym) { data.oracle.baseFeed.symbol = _sym; } catch {}
-        }
-
-        if (address(data.oracle.quoteFeed1) != address(0)) {
-            data.oracle.quoteFeed.oracleAddress = address(data.oracle.quoteFeed1);
-            
-            try data.oracle.quoteFeed1.latestRoundData() returns (
-                uint80, int256 answer, uint256, uint256, uint80
-            ) { 
-                data.oracle.quoteFeed.price = answer > 0 ? uint256(answer) : 0; 
-            } catch {}
-
-            try data.oracle.quoteFeed1.decimals() returns (uint8 _dec) { data.oracle.quoteFeed.decimals = _dec; } catch {}
-            try data.oracle.quoteFeed1.description() returns (string memory _sym) { data.oracle.quoteFeed.symbol = _sym; } catch {}
-        }
+        data.oracle.baseFeed = _feedInfo(address(data.oracle.baseFeed1));
+        data.oracle.quoteFeed = _feedInfo(address(data.oracle.quoteFeed1));
 
         if (morphoAddress != address(0) && marketId != bytes32(0)) {
             address deadAddress = 0x000000000000000000000000000000000000dEaD;
@@ -126,5 +97,85 @@ contract MorphoMarketDataFetcher {
             Position memory deadPosition = IMorpho(morphoAddress).position(Id.wrap(marketId), deadAddress);
             data.deadAddressSupply = deadPosition.supplyShares;
         }
+    }
+
+    function _tokenInfo(address token, address user) private view returns (TokenInfo memory info) {
+        info.tokenAddress = token;
+        if (token.code.length == 0) return info;
+
+        info.name = _tryString(token, IERC20Metadata.name.selector);
+        info.symbol = _tryString(token, IERC20Metadata.symbol.selector);
+        info.decimals = _tryUint8(token, abi.encodeCall(IERC20Metadata.decimals, ()));
+
+        if (user != address(0) && morphoAddress != address(0)) {
+            (bool ok, bytes memory ret) = token.staticcall(abi.encodeWithSignature("allowance(address,address)", user, morphoAddress));
+            if (ok && ret.length >= 32) info.userAllowance = abi.decode(ret, (uint256));
+        }
+    }
+
+    function _feedInfo(address feed) private view returns (MockOracleInfo memory info) {
+        if (feed == address(0)) return info;
+        info.oracleAddress = feed;
+        if (feed.code.length == 0) return info;
+
+        (bool ok, bytes memory ret) = feed.staticcall(abi.encodeCall(AggregatorV3Interface.latestRoundData, ()));
+        if (ok && ret.length >= 160) {
+            int256 answer;
+            assembly {
+                answer := mload(add(ret, 64)) // second word: answer
+            }
+            info.price = answer > 0 ? uint256(answer) : 0;
+        }
+        info.decimals = _tryUint8(feed, abi.encodeCall(AggregatorV3Interface.decimals, ()));
+        info.symbol = _tryString(feed, AggregatorV3Interface.description.selector);
+    }
+
+    function _tryUint(address target, bytes4 selector) private view returns (uint256 value) {
+        (bool ok, bytes memory ret) = target.staticcall(abi.encodeWithSelector(selector));
+        if (ok && ret.length >= 32) value = abi.decode(ret, (uint256));
+    }
+
+    function _tryAddress(address target, bytes4 selector) private view returns (address) {
+        uint256 value = _tryUint(target, selector);
+        return value <= type(uint160).max ? address(uint160(value)) : address(0);
+    }
+
+    function _tryUint8(address target, bytes memory callData) private view returns (uint8) {
+        (bool ok, bytes memory ret) = target.staticcall(callData);
+        if (!ok || ret.length < 32) return 0;
+        uint256 value = abi.decode(ret, (uint256));
+        return value <= type(uint8).max ? uint8(value) : 0;
+    }
+
+    /// @dev Decodes an ABI-encoded string, or a bytes32 (e.g. MKR-style tokens). Returns "" otherwise.
+    function _tryString(address target, bytes4 selector) private view returns (string memory) {
+        (bool ok, bytes memory ret) = target.staticcall(abi.encodeWithSelector(selector));
+        if (!ok) return "";
+
+        if (ret.length >= 64) {
+            uint256 offset;
+            uint256 len;
+            assembly {
+                offset := mload(add(ret, 32))
+            }
+            if (offset == 32) {
+                assembly {
+                    len := mload(add(ret, 64))
+                }
+                if (len <= ret.length - 64) return abi.decode(ret, (string));
+            }
+            return "";
+        }
+
+        if (ret.length == 32) {
+            bytes32 raw = abi.decode(ret, (bytes32));
+            uint256 n;
+            while (n < 32 && raw[n] != 0) n++;
+            bytes memory out = new bytes(n);
+            for (uint256 i; i < n; i++) out[i] = raw[i];
+            return string(out);
+        }
+
+        return "";
     }
 }
