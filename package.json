@@ -1,7 +1,11 @@
 {
   "name": "morpho-contracts-helper",
   "version": "0.0.21",
-  "description": "",
+  "description": "Helper contracts and TypeChain bindings for Morpho markets and vaults with API3 data feeds",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/api3dao/morpho-contracts-helper.git"
+  },
   "main": "dist/src/index",
   "types": "dist/src/index",
   "scripts": {
