@@ -1,11 +1,19 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "./external/api3/interfaces/IApi3ServerV1.sol";
-import {IMorpho, MarketParams, Market, Id, Position} from "./external/morpho/interfaces/IMorpho.sol";
-import {IERC20} from "./external/morpho/interfaces/IERC20.sol";
+import {IApi3ServerV1} from "./external/api3/interfaces/IApi3ServerV1.sol";
+import {IMorpho, MarketParams} from "./external/morpho/interfaces/IMorpho.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-contract LiquidationHelper {
+/// @notice Updates API3 feeds and liquidates Morpho Blue positions in one transaction.
+/// @dev Anyone may call `updateAndLiquidate`. A caller can only spend what it brings: the builder
+///      tip is paid from `msg.value` (excess refunded), and only the tokens this liquidation adds to
+///      the helper are swept to the caller. ETH and tokens already held by the helper are untouched
+///      and can be withdrawn only by the owner.
+contract LiquidationHelper is ReentrancyGuard {
+    using SafeERC20 for IERC20;
 
     IApi3ServerV1 public immutable api3ServerV1;
     IMorpho public immutable morpho;
@@ -68,42 +76,48 @@ contract LiquidationHelper {
         LiquidationParams calldata liq,
         uint256 maxUSDCToUse,
         uint256 tipAmount
-    ) external payable {
-        IERC20 loanToken = IERC20(liq.marketParams.loanToken);
-        
-        uint256 balanceBefore = loanToken.balanceOf(address(this));
+    ) external payable nonReentrant {
+        uint256 finalTip = tipAmount > 0 ? tipAmount : msg.value;
+        require(finalTip <= msg.value, "Tip exceeds msg.value");
 
-        loanToken.transferFrom(msg.sender, address(this), maxUSDCToUse);
+        IERC20 loanToken = IERC20(liq.marketParams.loanToken);
+        IERC20 collateralToken = IERC20(liq.marketParams.collateralToken);
+
+        uint256 loanBefore = loanToken.balanceOf(address(this));
+        uint256 collateralBefore = collateralToken.balanceOf(address(this));
+
+        loanToken.safeTransferFrom(msg.sender, address(this), maxUSDCToUse);
 
         _executeMulticall(data);
-        loanToken.approve(address(morpho), type(uint256).max);
+        loanToken.forceApprove(address(morpho), type(uint256).max);
         morpho.liquidate(liq.marketParams, liq.borrower, liq.seizedAssets, liq.repaidShares, liq.data);
-        loanToken.approve(address(morpho), 0);
+        loanToken.forceApprove(address(morpho), 0);
 
-        _sweepTokens(loanToken, liq.marketParams.collateralToken, msg.sender);
-
-        require(loanToken.balanceOf(address(this)) <= balanceBefore, "Safety check: Funds trapped!");
-
-        uint256 finalTip = tipAmount > 0 ? tipAmount : msg.value;
-        require(address(this).balance >= finalTip, "Insufficient balance for tip");
-        _tipBuilder(finalTip);
-    }
-
-    function _sweepTokens(IERC20 loanToken, address collateralAddress, address recipient) private {
-        uint256 remainingLoan = loanToken.balanceOf(address(this));
-        if (remainingLoan > 0) {
-            loanToken.transfer(recipient, remainingLoan);
+        // Repayment must be covered by the caller's tokens, never by the helper's own balance.
+        uint256 loanAfter = loanToken.balanceOf(address(this));
+        require(loanAfter >= loanBefore, "Repay exceeds caller funds");
+        if (loanAfter > loanBefore) {
+            loanToken.safeTransfer(msg.sender, loanAfter - loanBefore);
         }
 
-        IERC20 collateralToken = IERC20(collateralAddress);
-        uint256 collateralEarned = collateralToken.balanceOf(address(this));
-        if (collateralEarned > 0) {
-            collateralToken.transfer(recipient, collateralEarned);
+        // Measured after the loan sweep so a market with loanToken == collateralToken is not double-counted.
+        uint256 collateralAfter = collateralToken.balanceOf(address(this));
+        if (collateralAfter > collateralBefore) {
+            collateralToken.safeTransfer(msg.sender, collateralAfter - collateralBefore);
+        }
+
+        if (finalTip > 0) {
+            _tipBuilder(finalTip);
+        }
+        uint256 refund = msg.value - finalTip;
+        if (refund > 0) {
+            (bool ok, ) = msg.sender.call{value: refund}("");
+            require(ok, "Refund failed");
         }
     }
 
     function withdrawToken(address token, uint256 amount) external onlyOwner {
-        IERC20(token).transfer(owner, amount);
+        IERC20(token).safeTransfer(owner, amount);
     }
 
     function withdrawETH(uint256 amount) external onlyOwner {

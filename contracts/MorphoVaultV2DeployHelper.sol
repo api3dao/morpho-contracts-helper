@@ -21,6 +21,9 @@ contract MorphoVaultV2DeployHelper {
 
     address constant DEAD_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
+    /// @notice Per-caller counter used to derive unique CREATE2 salts for new vaults.
+    mapping(address => uint256) public deployNonce;
+
     constructor(address _vaultV2FactoryAddress, address _adapterV2FactoryAddress, address _morphoRegistryAddress) {
         vaultV2FactoryAddress = _vaultV2FactoryAddress;
         adapterV2FactoryAddress = _adapterV2FactoryAddress;
@@ -43,6 +46,10 @@ contract MorphoVaultV2DeployHelper {
         uint256 vaultTimelockHigh; 
         uint256 vaultTimelockMid;  
         uint256 adapterTimelock;   
+
+        /// @dev VaultV2 maxRate (per-second, WAD). 0 leaves it unset; the allocator must then call
+        ///      setMaxRate before the vault can accrue interest.
+        uint256 maxRate;
     }
 
     struct DeployResult {
@@ -51,7 +58,7 @@ contract MorphoVaultV2DeployHelper {
     }
 
     function _deploy(DeployParams calldata p) internal returns (DeployResult memory result) {
-        bytes32 uniqueSalt = keccak256(abi.encodePacked(block.timestamp + gasleft()));
+        bytes32 uniqueSalt = _nextSalt(p.asset);
 
         address vault = IVaultV2Factory(vaultV2FactoryAddress).createVaultV2(
             address(this),
@@ -106,6 +113,10 @@ contract MorphoVaultV2DeployHelper {
             _configureMarketAndLiquidityAdapter(vault, p.marketID, adapter, p.asset);
         }
 
+        if (p.maxRate > 0) {
+            iVault2.setMaxRate(p.maxRate);
+        }
+
         iVault2.submit(abi.encodeCall(IVaultV2.setIsAllocator, (address(this), false)));
         iVault2.setIsAllocator(address(this), false);
 
@@ -154,6 +165,18 @@ contract MorphoVaultV2DeployHelper {
         iVault2.submit(abi.encodeCall(IVaultV2.increaseRelativeCap, (marketIdData, 1e18)));
         iVault2.increaseAbsoluteCap(marketIdData, type(uint128).max);
         iVault2.increaseRelativeCap(marketIdData, 1e18);
+    }
+
+    /// @dev Salt bound to the caller and a nonce; skips salts already used (e.g. front-run) for this asset.
+    function _nextSalt(address asset) internal returns (bytes32 salt) {
+        uint256 nonce = deployNonce[msg.sender];
+        IVaultV2Factory factory = IVaultV2Factory(vaultV2FactoryAddress);
+        while (true) {
+            salt = keccak256(abi.encode(msg.sender, nonce));
+            nonce++;
+            if (factory.vaultV2(address(this), asset, salt) == address(0)) break;
+        }
+        deployNonce[msg.sender] = nonce;
     }
 
     function _validateDepositAmount(uint256 requiredDeadDeposit, uint256 deadSupplyShares) internal pure {
